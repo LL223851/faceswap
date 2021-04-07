@@ -1,36 +1,47 @@
 #!/usr/bin/env python3
 """ Install packages for faceswap.py """
 
-# >>> ENV
+# >>> Environment
 import ctypes
+import json
 import locale
+import platform
+import operator
 import os
 import re
 import sys
-import platform
-
 from subprocess import CalledProcessError, run, PIPE, Popen
 
+from pkg_resources import parse_requirements, Requirement
+
 INSTALL_FAILED = False
-# Revisions of tensorflow-gpu and cuda/cudnn requirements
-TENSORFLOW_REQUIREMENTS = {"==1.12.0": ["9.0", "7.2"],
-                           ">=1.13.1": ["10.0", "7.4"]}
+# Revisions of tensorflow GPU and cuda/cudnn requirements
+TENSORFLOW_REQUIREMENTS = {">=2.2.0,<2.4.0": ["10.1", "7.6"]}
+# Mapping of Python packages to their conda names if different from pip or in non-default channel
+CONDA_MAPPING = {
+    # "opencv-python": ("opencv", "conda-forge"),  # Periodic issues with conda-forge opencv
+    "fastcluster": ("fastcluster", "conda-forge"),
+    "toposort": ("toposort", "conda-forge"),
+    "imageio-ffmpeg": ("imageio-ffmpeg", "conda-forge")}
 
 
 class Environment():
     """ The current install environment """
-    def __init__(self):
-        self.macos_required_packages = ["pynvx==0.0.4"]
-        self.conda_required_packages = [("ffmpeg", "conda-forge"), ("tk", )]
-        self.output = Output()
+    def __init__(self, logger=None, updater=False):
+        """ logger will override built in Output() function if passed in
+            updater indicates that this is being run from update_deps.py
+            so certain steps can be skipped/output limited """
+        self.conda_required_packages = [("tk", )]
+        self.output = logger if logger else Output()
+        self.updater = updater
         # Flag that setup is being run by installer so steps can be skipped
         self.is_installer = False
-        self.cuda_path = ""
         self.cuda_version = ""
         self.cudnn_version = ""
+        self.enable_amd = False
         self.enable_docker = False
         self.enable_cuda = False
-        self.required_packages = self.get_required_packages()
+        self.required_packages = list()
         self.missing_packages = list()
         self.conda_missing_packages = list()
 
@@ -43,7 +54,7 @@ class Environment():
         self.upgrade_pip()
 
         self.installed_packages = self.get_installed_packages()
-        self.get_installed_conda_packages()
+        self.installed_packages.update(self.get_installed_conda_packages())
 
     @property
     def encoding(self):
@@ -52,28 +63,19 @@ class Environment():
 
     @property
     def os_version(self):
-        """ Get OS Verion """
+        """ Get OS Version """
         return platform.system(), platform.release()
 
     @property
     def py_version(self):
-        """ Get Python Verion """
+        """ Get Python Version """
         return platform.python_version(), platform.architecture()[0]
-
-    @property
-    def is_macos(self):
-        """ Check whether MacOS """
-        return bool(platform.system() == "Darwin")
 
     @property
     def is_conda(self):
         """ Check whether using Conda """
-        return bool("conda" in sys.version.lower())
-
-    @property
-    def ld_library_path(self):
-        """ Get the ld library path """
-        return os.environ.get("LD_LIBRARY_PATH", None)
+        return ("conda" in sys.version.lower() or
+                os.path.exists(os.path.join(sys.prefix, 'conda-meta')))
 
     @property
     def is_admin(self):
@@ -96,56 +98,81 @@ class Environment():
         return retval
 
     def process_arguments(self):
-        """ Process any cli arguments """
-        argv = [arg for arg in sys.argv]
-        for arg in argv:
+        """ Process any cli arguments and dummy in cli arguments if calling from updater. """
+        args = [arg for arg in sys.argv]  # pylint:disable=unnecessary-comprehension
+        if self.updater:
+            from lib.utils import get_backend  # pylint:disable=import-outside-toplevel
+            args.append("--{}".format(get_backend()))
+
+        for arg in args:
             if arg == "--installer":
                 self.is_installer = True
-            if arg == "--gpu":
+            if arg == "--nvidia":
                 self.enable_cuda = True
+            if arg == "--amd":
+                self.enable_amd = True
 
-    @staticmethod
-    def get_required_packages():
+    def get_required_packages(self):
         """ Load requirements list """
-        packages = list()
+        if self.enable_amd:
+            suffix = "amd.txt"
+        elif self.enable_cuda:
+            suffix = "nvidia.txt"
+        else:
+            suffix = "cpu.txt"
+        req_files = ["_requirements_base.txt", f"requirements_{suffix}"]
         pypath = os.path.dirname(os.path.realpath(__file__))
-        requirements_file = os.path.join(pypath, "requirements.txt")
-        with open(requirements_file) as req:
-            for package in req.readlines():
-                package = package.strip()
-                if package and (not package.startswith("#")):
-                    packages.append(package)
-        return packages
+        requirements = list()
+        git_requirements = list()
+        for req_file in req_files:
+            requirements_file = os.path.join(pypath, req_file)
+            with open(requirements_file) as req:
+                for package in req.readlines():
+                    package = package.strip()
+                    # parse_requirements can't handle git dependencies, so extract and then
+                    # manually add to final list
+                    if package and package.startswith("git+"):
+                        git_requirements.append((package, []))
+                        continue
+                    if package and (not package.startswith(("#", "-r"))):
+                        requirements.append(package)
+        self.required_packages = [(pkg.name, pkg.specs)
+                                  for pkg in parse_requirements(requirements)
+                                  if pkg.marker is None or pkg.marker.evaluate()]
+        self.required_packages.extend(git_requirements)
 
     def check_permission(self):
         """ Check for Admin permissions """
+        if self.updater:
+            return
         if self.is_admin:
             self.output.info("Running as Root/Admin")
         else:
-            self.output.warning("Running without root/admin privileges")
+            self.output.info("Running without root/admin privileges")
 
     def check_system(self):
         """ Check the system """
-        self.output.info("The tool provides tips for installation\n"
-                         "and installs required python packages")
+        if not self.updater:
+            self.output.info("The tool provides tips for installation\n"
+                             "and installs required python packages")
         self.output.info("Setup in %s %s" % (self.os_version[0], self.os_version[1]))
-        if not self.os_version[0] in ["Windows", "Linux", "Darwin"]:
+        if not self.updater and not self.os_version[0] in ["Windows", "Linux", "Darwin"]:
             self.output.error("Your system %s is not supported!" % self.os_version[0])
-            exit(1)
+            sys.exit(1)
 
     def check_python(self):
         """ Check python and virtual environment status """
         self.output.info("Installed Python: {0} {1}".format(self.py_version[0],
                                                             self.py_version[1]))
         if not (self.py_version[0].split(".")[0] == "3"
-                and self.py_version[0].split(".")[1] in ("3", "4", "5", "6")
-                and self.py_version[1] == "64bit"):
-            self.output.error("Please run this script with Python version 3.3, 3.4, 3.5 or 3.6 "
+                and self.py_version[0].split(".")[1] in ("7", "8")
+                and self.py_version[1] == "64bit") and not self.updater:
+            self.output.error("Please run this script with Python version 3.7 or 3.8 "
                               "64bit and try again.")
-            exit(1)
+            sys.exit(1)
 
     def output_runtime_info(self):
-        """ Output runtime info """
+        """ Output run time info """
         if self.is_conda:
             self.output.info("Running in Conda")
         if self.is_virtualenv:
@@ -154,16 +181,18 @@ class Environment():
 
     def check_pip(self):
         """ Check installed pip version """
+        if self.updater:
+            return
         try:
-            import pip  # noqa pylint:disable=unused-import
+            import pip  # noqa pylint:disable=unused-import,import-outside-toplevel
         except ImportError:
             self.output.error("Import pip failed. Please Install python3-pip and try again")
-            exit(1)
+            sys.exit(1)
 
     def upgrade_pip(self):
         """ Upgrade pip to latest version """
         if not self.is_conda:
-            # Don't do this with Conda, as we must use conda's pip
+            # Don't do this with Conda, as we must use Conda version of pip
             self.output.info("Upgrading pip...")
             pipexe = [sys.executable, "-m", "pip"]
             pipexe.extend(["install", "--no-cache-dir", "-qq", "--upgrade"])
@@ -171,7 +200,7 @@ class Environment():
                 pipexe.append("--user")
             pipexe.append("pip")
             run(pipexe)
-        import pip
+        import pip  # pylint:disable=import-outside-toplevel
         pip_version = pip.__version__
         self.output.info("Installed pip: {}".format(pip_version))
 
@@ -192,22 +221,20 @@ class Environment():
     def get_installed_conda_packages(self):
         """ Get currently installed conda packages """
         if not self.is_conda:
-            return
+            return None
         chk = os.popen("conda list").read()
         installed = [re.sub(" +", " ", line.strip())
                      for line in chk.splitlines() if not line.startswith("#")]
+        retval = dict()
         for pkg in installed:
             item = pkg.split(" ")
-            self.installed_packages[item[0]] = item[1]
+            retval[item[0]] = item[1]
+        return retval
 
     def update_tf_dep(self):
         """ Update Tensorflow Dependency """
-        if self.is_conda:
-            self.update_tf_dep_conda()
-            return
-
-        if not self.enable_cuda:
-            self.required_packages.append("tensorflow")
+        if self.is_conda or not self.enable_cuda:
+            # CPU/AMD doesn't need Cuda and Conda handles Cuda and cuDNN so nothing to do here
             return
 
         tf_ver = None
@@ -220,12 +247,16 @@ class Environment():
                 tf_ver = key
                 break
         if tf_ver:
+            # Remove the version of tensorflow in requirements file and add the correct version
+            # that corresponds to the installed Cuda/cuDNN versions
+            self.required_packages = [pkg for pkg in self.required_packages
+                                      if not pkg.startswith("tensorflow-gpu")]
             tf_ver = "tensorflow-gpu{}".format(tf_ver)
             self.required_packages.append(tf_ver)
             return
 
         self.output.warning(
-            "The minimum Tensorflow requirement is 1.12. \n"
+            "The minimum Tensorflow requirement is 2.3 \n"
             "Tensorflow currently has no official prebuild for your CUDA, cuDNN "
             "combination.\nEither install a combination that Tensorflow supports or "
             "build and install your own tensorflow-gpu.\r\n"
@@ -250,12 +281,20 @@ class Environment():
         elif custom_tf:
             self.required_packages.append(custom_tf)
 
-    def update_tf_dep_conda(self):
-        """ Update Conda TF Dependency """
-        if not self.enable_cuda:
-            self.required_packages.append("tensorflow==1.12.0")
+    def set_config(self):
+        """ Set the backend in the faceswap config file """
+        if self.enable_amd:
+            backend = "amd"
+        elif self.enable_cuda:
+            backend = "nvidia"
         else:
-            self.required_packages.append("tensorflow-gpu==1.12.0")
+            backend = "cpu"
+        config = {"backend": backend}
+        pypath = os.path.dirname(os.path.realpath(__file__))
+        config_file = os.path.join(pypath, "config", ".faceswap")
+        with open(config_file, "w") as cnf:
+            json.dump(config, cnf)
+        self.output.info("Faceswap config written to: {}".format(config_file))
 
 
 class Output():
@@ -312,24 +351,43 @@ class Checks():
 
     # Checks not required for installer
         if self.env.is_installer:
-            self.env.update_tf_dep()
             return
 
-    # Ask Docker/Cuda
-        self.docker_ask_enable()
-        self.cuda_ask_enable()
+    # Ask AMD/Docker/Cuda
+        self.amd_ask_enable()
+        if not self.env.enable_amd:
+            self.docker_ask_enable()
+            self.cuda_ask_enable()
         if self.env.os_version[0] != "Linux" and self.env.enable_docker and self.env.enable_cuda:
             self.docker_confirm()
         if self.env.enable_docker:
             self.docker_tips()
-            exit(0)
+            self.env.set_config()
+            sys.exit(0)
 
     # Check for CUDA and cuDNN
         if self.env.enable_cuda and self.env.is_conda:
             self.output.info("Skipping Cuda/cuDNN checks for Conda install")
         elif self.env.enable_cuda and self.env.os_version[0] in ("Linux", "Windows"):
-            self.cuda_check()
-            self.cudnn_check()
+            check = CudaCheck()
+            if check.cuda_version:
+                self.env.cuda_version = check.cuda_version
+                self.output.info("CUDA version: " + self.env.cuda_version)
+            else:
+                self.output.error("CUDA not found. Install and try again.\n"
+                                  "Recommended version:      CUDA 10.1     cuDNN 7.6\n"
+                                  "CUDA: https://developer.nvidia.com/cuda-downloads\n"
+                                  "cuDNN: https://developer.nvidia.com/rdp/cudnn-download")
+                return
+
+            if check.cudnn_version:
+                self.env.cudnn_version = ".".join(check.cudnn_version.split(".")[:2])
+                self.output.info(f"cuDNN version: {self.env.cudnn_version}")
+            else:
+                self.output.error("cuDNN not found. See "
+                                  "https://github.com/deepfakes/faceswap/blob/master/INSTALL.md#"
+                                  "cudnn for instructions")
+                return
         elif self.env.enable_cuda and self.env.os_version[0] not in ("Linux", "Windows"):
             self.tips.macos()
             self.output.warning("Cannot find CUDA on macOS")
@@ -338,6 +396,18 @@ class Checks():
         self.env.update_tf_dep()
         if self.env.os_version[0] == "Windows":
             self.tips.pip()
+
+    def amd_ask_enable(self):
+        """ Enable or disable Plaidml for AMD"""
+        self.output.info("AMD Support: AMD GPU support is currently limited.\r\n"
+                         "Nvidia Users MUST answer 'no' to this option.")
+        i = input("Enable AMD Support? [y/N] ")
+        if i in ("Y", "y"):
+            self.output.info("AMD Support Enabled")
+            self.env.enable_amd = True
+        else:
+            self.output.info("AMD Support Disabled")
+            self.env.enable_amd = False
 
     def docker_ask_enable(self):
         """ Enable or disable Docker """
@@ -350,7 +420,7 @@ class Checks():
             self.env.enable_docker = False
 
     def docker_confirm(self):
-        """ Warn if nvidia-docker on non-linux system """
+        """ Warn if nvidia-docker on non-Linux system """
         self.output.warning("Nvidia-Docker is only supported on Linux.\r\n"
                             "Only CPU is supported in Docker for your system")
         self.docker_ask_enable()
@@ -375,75 +445,79 @@ class Checks():
             self.output.info("CUDA Disabled")
             self.env.enable_cuda = False
 
-    def cuda_check(self):
-        """ Check Cuda for Linux or Windows """
+
+class CudaCheck():  # pylint:disable=too-few-public-methods
+    """ Find the location of system installed Cuda and cuDNN on Windows and Linux. """
+
+    def __init__(self):
+        self.cuda_path = None
+        self.cuda_version = None
+        self.cudnn_version = None
+
+        self._os = platform.system().lower()
+        self._cuda_keys = [key for key in os.environ if key.lower().startswith("cuda_path_v")]
+        self._cudnn_header_files = ["cudnn_version.h", "cudnn.h"]
+
+        if self._os in ("windows", "linux"):
+            self._cuda_check()
+            self._cudnn_check()
+
+    def _cuda_check(self):
+        """ Obtain the location and version of Cuda and populate :attr:`cuda_version` and
+        :attr:`cuda_path`
+
+        Initially just calls `nvcc -V` to get the installed version of Cuda currently in use.
+        If this fails, drills down to more OS specific checking methods.
+        """
         chk = Popen("nvcc -V", shell=True, stdout=PIPE, stderr=PIPE)
         stdout, stderr = chk.communicate()
         if not stderr:
-            version = re.search(r".*release (?P<cuda>\d+\.\d+)", stdout.decode(self.env.encoding))
-            self.env.cuda_version = version.groupdict().get("cuda", None)
-            if self.env.cuda_version:
-                self.output.info("CUDA version: " + self.env.cuda_version)
-                return
-        # Failed to load nvcc
-        if self.env.os_version[0] == "Linux":
-            self.cuda_check_linux()
-        elif self.env.os_version[0] == "Windows":
-            self.cuda_check_windows()
+            version = re.search(r".*release (?P<cuda>\d+\.\d+)",
+                                stdout.decode(locale.getpreferredencoding()))
+            self.cuda_version = version.groupdict().get("cuda", None)
+            locate = "where" if self._os == "windows" else "which"
+            path = os.popen(f"{locate} nvcc").read()
+            if path:
+                path = path.split("\n")[0]  # Split multiple entries and take first found
+                while True:  # Get Cuda root folder
+                    path, split = os.path.split(path)
+                    if split == "bin":
+                        break
+                self.cuda_path = path
+            return
 
-    def cuda_check_linux(self):
-        """ Check Linux CUDA Version """
+        # Failed to load nvcc, manual check
+        getattr(self, f"_cuda_check_{self._os}")()
+
+    def _cuda_check_linux(self):
+        """ For Linux check the dynamic link loader for libcudart. If not found with ldconfig then
+        attempt to find it in LD_LIBRARY_PATH. """
         chk = os.popen("ldconfig -p | grep -P \"libcudart.so.\\d+.\\d+\" | head -n 1").read()
-        if self.env.ld_library_path and not chk:
-            paths = self.env.ld_library_path.split(":")
-            for path in paths:
-                chk = os.popen("ls {} | grep -P -o \"libcudart.so.\\d+.\\d+\" | "
-                               "head -n 1".format(path)).read()
+        if not chk and os.environ.get("LD_LIBRARY_PATH"):
+            for path in os.environ["LD_LIBRARY_PATH"].split(":"):
+                chk = os.popen(f"ls {path} | grep -P -o \"libcudart.so.\\d+.\\d+\" | "
+                               "head -n 1").read()
                 if chk:
                     break
-        if not chk:
-            self.output.error("CUDA not found. Install and try again.\n"
-                              "Recommended version:      CUDA 9.0     cuDNN 7.1.3\n"
-                              "CUDA: https://developer.nvidia.com/cuda-downloads\n"
-                              "cuDNN: https://developer.nvidia.com/rdp/cudnn-download")
+        if not chk:  # Cuda not found
             return
+
         cudavers = chk.strip().replace("libcudart.so.", "")
-        self.env.cuda_version = cudavers[:cudavers.find(" ")]
-        if self.env.cuda_version:
-            self.output.info("CUDA version: " + self.env.cuda_version)
-            self.env.cuda_path = chk[chk.find("=>") + 3:chk.find("targets") - 1]
+        self.cuda_version = cudavers[:cudavers.find(" ")]
+        self.cuda_path = chk[chk.find("=>") + 3:chk.find("targets") - 1]
 
-    def cuda_check_windows(self):
-        """ Check Windows CUDA Version """
-        cuda_keys = [key
-                     for key in os.environ.keys()
-                     if key.lower().startswith("cuda_path_v")]
-        if not cuda_keys:
-            self.output.error("CUDA not found. See "
-                              "https://github.com/deepfakes/faceswap/blob/master/INSTALL.md#cuda "
-                              "for instructions")
+    def _cuda_check_windows(self):
+        """ Check Windows CUDA Version and path from Environment Variables"""
+        if not self._cuda_keys:  # Cuda environment variable not found
             return
+        self.cuda_version = self._cuda_keys[0].lower().replace("cuda_path_v", "").replace("_", ".")
+        self.cuda_path = os.environ[self._cuda_keys[0][0]]
 
-        self.env.cuda_version = cuda_keys[0].replace("CUDA_PATH_V", "").replace("_", ".")
-        self.env.cuda_path = os.environ[cuda_keys[0]]
-        self.output.info("CUDA version: " + self.env.cuda_version)
-
-    def cudnn_check(self):
-        """ Check Linux or Windows cuDNN Version from cudnn.h """
-        if self.env.os_version[0] == "Linux":
-            cudnn_checkfiles = self.cudnn_checkfiles_linux()
-        elif self.env.os_version[0] == "Windows":
-            cudnn_checkfiles = self.cudnn_checkfiles_windows()
-
-        cudnn_checkfile = None
-        for checkfile in cudnn_checkfiles:
-            if os.path.isfile(checkfile):
-                cudnn_checkfile = checkfile
-                break
+    def _cudnn_check(self):
+        """ Check Linux or Windows cuDNN Version from cudnn.h and add to :attr:`cudnn_version`. """
+        cudnn_checkfiles = getattr(self, f"_get_checkfiles_{self._os}")()
+        cudnn_checkfile = next((hdr for hdr in cudnn_checkfiles if os.path.isfile(hdr)), None)
         if not cudnn_checkfile:
-            self.output.error("cuDNN not found. See "
-                              "https://github.com/deepfakes/faceswap/blob/master/INSTALL.md#cudnn "
-                              "for instructions")
             return
         found = 0
         with open(cudnn_checkfile, "r") as ofile:
@@ -459,47 +533,74 @@ class Checks():
                     found += 1
                 if found == 3:
                     break
-        if found != 3:
-            self.output.error("cuDNN version could not be determined. See "
-                              "https://github.com/deepfakes/faceswap/blob/master/INSTALL.md#cudnn "
-                              "for instructions")
+        if found != 3:  # Full version could not be determined
             return
+        self.cudnn_version = ".".join([str(major), str(minor), str(patchlevel)])
 
-        self.env.cudnn_version = "{}.{}".format(major, minor)
-        self.output.info("cuDNN version: {}.{}".format(self.env.cudnn_version, patchlevel))
+    def _get_checkfiles_linux(self):
+        """ Return the the files to check for cuDNN locations for Linux by querying
+        the dynamic link loader.
 
-    @staticmethod
-    def cudnn_checkfiles_linux():
-        """ Return the checkfile locations for linux """
+        Returns
+        -------
+        list
+            List of header file locations to scan for cuDNN versions
+        """
         chk = os.popen("ldconfig -p | grep -P \"libcudnn.so.\\d+\" | head -n 1").read()
         chk = chk.strip().replace("libcudnn.so.", "")
+        if not chk:
+            return list()
+
         cudnn_vers = chk[0]
-        cudnn_path = chk[chk.find("=>") + 3:chk.find("libcudnn") - 1]
+        header_files = [f"cudnn_v{cudnn_vers}.h"] + self._cudnn_header_files
+
+        cudnn_path = os.path.realpath(chk[chk.find("=>") + 3:chk.find("libcudnn") - 1])
         cudnn_path = cudnn_path.replace("lib", "include")
-        cudnn_checkfiles = [os.path.join(cudnn_path, "cudnn_v{}.h".format(cudnn_vers)),
-                            os.path.join(cudnn_path, "cudnn.h")]
+        cudnn_checkfiles = [os.path.join(cudnn_path, header) for header in header_files]
         return cudnn_checkfiles
 
-    def cudnn_checkfiles_windows(self):
-        """ Return the checkfile locations for windows """
+    def _get_checkfiles_windows(self):
+        """ Return the check-file locations for Windows. Just looks inside the include folder of
+        the discovered :attr:`cuda_path`
+
+        Returns
+        -------
+        list
+            List of header file locations to scan for cuDNN versions
+        """
         # TODO A more reliable way of getting the windows location
-        if not self.env.cuda_path:
+        if not self.cuda_path:
             return list()
-        cudnn_checkfile = os.path.join(self.env.cuda_path, "include", "cudnn.h")
-        return [cudnn_checkfile]
+        scandir = os.path.join(self.cuda_path, "include")
+        cudnn_checkfiles = [os.path.join(scandir, header) for header in self._cudnn_header_files]
+        return cudnn_checkfiles
 
 
 class Install():
     """ Install the requirements """
     def __init__(self, environment):
-        self.output = Output()
+        self._operators = {"==": operator.eq,
+                           ">=": operator.ge,
+                           "<=": operator.le,
+                           ">": operator.gt,
+                           "<": operator.lt}
+        self.output = environment.output
         self.env = environment
 
-        if not self.env.is_installer:
+        if not self.env.is_installer and not self.env.updater:
             self.ask_continue()
+        self.env.get_required_packages()
         self.check_missing_dep()
         self.check_conda_missing_dep()
+        if (self.env.updater and
+                not self.env.missing_packages and not self.env.conda_missing_packages):
+            self.output.info("All Dependencies are up to date")
+            return
+        if self.env.updater:
+            self._remove_unrequired_packages()
         self.install_missing_dep()
+        if self.env.updater:
+            return
         self.output.info("All python3 dependencies are met.\r\nYou are good to go.\r\n\r\n"
                          "Enter:  'python faceswap.py -h' to see the options\r\n"
                          "        'python faceswap.py gui' to launch the GUI")
@@ -509,22 +610,26 @@ class Install():
         inp = input("Please ensure your System Dependencies are met. Continue? [y/N] ")
         if inp in ("", "N", "n"):
             self.output.error("Please install system dependencies to continue")
-            exit(1)
+            sys.exit(1)
 
     def check_missing_dep(self):
         """ Check for missing dependencies """
-        if self.env.enable_cuda and self.env.is_macos:
-            self.env.required_packages.extend(self.env.macos_required_packages)
-        for pkg in self.env.required_packages:
-            key = pkg.split("==")[0]
-            if key not in self.env.installed_packages:
-                self.env.missing_packages.append(pkg)
+        for key, specs in self.env.required_packages:
+            if self.env.is_conda:
+                # Get Conda alias for Key
+                key = CONDA_MAPPING.get(key, (key, None))[0]
+            if (key == "git+https://github.com/deepfakes/nvidia-ml-py3.git" and
+                    self.env.installed_packages.get("nvidia-ml-py3", "") == "7.352.1"):
+                # Annoying explicit hack to get around our custom version of nvidia-ml=py3 being
+                # constantly re-downloaded
                 continue
-            else:
-                if len(pkg.split("==")) > 1:
-                    if pkg.split("==")[1] != self.env.installed_packages.get(key):
-                        self.env.missing_packages.append(pkg)
-                        continue
+            if key not in self.env.installed_packages:
+                self.env.missing_packages.append((key, specs))
+                continue
+            installed_vers = self.env.installed_packages.get(key, "")
+            if specs and not all(self._operators[spec[0]](installed_vers, spec[1])
+                                 for spec in specs):
+                self.env.missing_packages.append((key, specs))
 
     def check_conda_missing_dep(self):
         """ Check for conda missing dependencies """
@@ -535,11 +640,46 @@ class Install():
             if key not in self.env.installed_packages:
                 self.env.conda_missing_packages.append(pkg)
                 continue
-            else:
-                if len(pkg[0].split("==")) > 1:
-                    if pkg[0].split("==")[1] != self.env.installed_conda_packages.get(key):
-                        self.env.conda_missing_packages.append(pkg)
-                        continue
+            if len(pkg[0].split("==")) > 1:
+                if pkg[0].split("==")[1] != self.env.installed_conda_packages.get(key):
+                    self.env.conda_missing_packages.append(pkg)
+                    continue
+
+    def _remove_unrequired_packages(self):
+        """ Remove packages that have been installed by Pip that might now be installed by
+        Conda.
+
+        This specifically relates to tensorflow 2.2 when a Conda version was not available for
+        Windows, so needed to be installed by Pip, with the Cuda toolkit coming from Conda.
+
+        This method is left here in case it is needed in the future. """
+        if not self.env.is_conda or self.env.os_version[0] != "Windows":
+            return
+        installed_pip = self.env.get_installed_packages()
+        if "tensorflow-gpu" not in installed_pip:
+            return
+        if not installed_pip["tensorflow-gpu"].startswith("2.2"):
+            return
+        # The below are a load of pip installed tf dependencies. They may not need to be all
+        # removed, but won't hurt to take them out of pip and put in Conda
+        remove_packages = ["urllib3", "pyasn1", "idna", "chardet", "rsa", "requests",
+                           "pyasn1-modules", "oauthlib", "cachetools", "requests-oauthlib",
+                           "google-auth", "werkzeug", "tensorboard-plugin-wit", "protobuf",
+                           "numpy", "markdown", "grpcio", "google-auth-oauthlib", "absl-py",
+                           "wrapt", "termcolor", "tensorflow-gpu-estimator", "tensorboard",
+                           "opt-einsum", "keras-preprocessing", "h5py", "google-pasta", "gast",
+                           "astunparse", "tensorflow-gpu"]
+        self.output.info("Uninstalling Pip Tensorflow 2.2")
+        pipexe = [sys.executable, "-m", "pip", "uninstall", "-y", "-qq"]
+        if not self.env.is_admin and not self.env.is_virtualenv:
+            pipexe.append("--user")
+        pipexe.extend([pkg for pkg in remove_packages if pkg in installed_pip])
+
+        try:
+            run(pipexe, check=True)
+        except CalledProcessError:
+            self.output.warning("Couldn't remove Tensorflow 2.2 with pip. You should attempt this "
+                                "manually")
 
     def install_missing_dep(self):
         """ Install missing dependencies """
@@ -552,11 +692,19 @@ class Install():
     def install_python_packages(self):
         """ Install required pip packages """
         self.output.info("Installing Required Python Packages. This may take some time...")
-        for pkg in self.env.missing_packages:
+        for pkg, version in self.env.missing_packages:
             if self.env.is_conda:
-                verbose = pkg.startswith("tensorflow")
-                if self.conda_installer(pkg, verbose=verbose):
+                pkg = CONDA_MAPPING.get(pkg, (pkg, None))
+                channel = None if len(pkg) != 2 else pkg[1]
+                pkg = pkg[0]
+            if version:
+                pkg = "{}{}".format(pkg, ",".join("".join(spec) for spec in version))
+            if self.env.is_conda and not pkg.startswith("git"):
+                verbose = pkg.startswith("tensorflow") or self.env.updater
+                if self.conda_installer(pkg, verbose=verbose, channel=channel, conda_only=False):
                     continue
+                if pkg.startswith("tensorflow-gpu"):
+                    self._tensorflow_dependency_install()
             self.pip_installer(pkg)
 
     def install_conda_packages(self):
@@ -568,26 +716,49 @@ class Install():
 
     def conda_installer(self, package, channel=None, verbose=False, conda_only=False):
         """ Install a conda package """
+        #  Packages with special characters need to be enclosed in double quotes
+        cuda_cudnn = None
         success = True
         condaexe = ["conda", "install", "-y"]
-        if not verbose:
+        if not verbose or self.env.updater:
             condaexe.append("-q")
         if channel:
             condaexe.extend(["-c", channel])
+
+        # Windows TF2.3 doesn't pull in the Cuda toolkit, so we may as well be explicit
+        # TODO This is not a robust enough check if we have more than 1 tf version
+        if package.startswith("tensorflow-gpu"):  # Add toolkit
+            # TODO Remove this hack to lower the max supported TF version when TF2.4 can be
+            # installed by setup.py
+            package = package.replace("2.5.0", "2.4.0")
+            specs = Requirement.parse(package).specs
+            for key, val in TENSORFLOW_REQUIREMENTS.items():
+                req_specs = Requirement.parse("foobar" + key).specs
+                if all(item in req_specs for item in specs):
+                    cuda_cudnn = val
+                    break
+
+        if any(char in package for char in (" ", "<", ">", "*", "|")):
+            package = f"\"{package}\""
         condaexe.append(package)
-        self.output.info("Installing {}".format(package))
+
+        if cuda_cudnn is not None:
+            condaexe.extend([f"cudatoolkit={cuda_cudnn[0]}",
+                             f"cudnn={cuda_cudnn[1]}"])
+        self.output.info("Installing {}".format(package.replace("\"", "")))
+        shell = self.env.os_version[0] == "Windows"
         try:
             if verbose:
-                run(condaexe, check=True)
+                run(condaexe, check=True, shell=shell)
             else:
                 with open(os.devnull, "w") as devnull:
-                    run(condaexe, stdout=devnull, stderr=devnull, check=True)
+                    run(condaexe, stdout=devnull, stderr=devnull, check=True, shell=shell)
         except CalledProcessError:
             if not conda_only:
-                self.output.info("Couldn't install {} with Conda. Trying pip".format(package))
+                self.output.info(f"{package} not available in Conda. Installing with pip")
             else:
-                self.output.warning("Couldn't install {} with Conda. "
-                                    "Please install this package manually".format(package))
+                self.output.warning(f"Couldn't install {package} with Conda. "
+                                    "Please install this package manually")
             success = False
         return success
 
@@ -595,18 +766,44 @@ class Install():
         """ Install a pip package """
         pipexe = [sys.executable, "-m", "pip"]
         # hide info/warning and fix cache hang
-        pipexe.extend(["install", "-qq", "--no-cache-dir"])
+        pipexe.extend(["install", "--no-cache-dir"])
+        if not self.env.updater and not package.startswith("tensorflow"):
+            pipexe.append("-qq")
         # install as user to solve perm restriction
         if not self.env.is_admin and not self.env.is_virtualenv:
             pipexe.append("--user")
-        msg = "Installing {}".format(package)
+        msg = f"Installing {package}"
         self.output.info(msg)
         pipexe.append(package)
         try:
             run(pipexe, check=True)
         except CalledProcessError:
-            self.output.warning("Couldn't install {} with pip. "
-                                "Please install this package manually".format(package))
+            self.output.warning(f"Couldn't install {package} with pip. "
+                                "Please install this package manually")
+
+    def _tensorflow_dependency_install(self):
+        """ Install the Cuda/cuDNN dependencies from Conda when tensorflow is not available
+        in Conda.
+
+        This was used whilst Tensorflow 2.2 was not available for Windows in Conda. It is kept
+        here in case it is required again in the future.
+        """
+        # TODO This will need to be more robust if/when we accept multiple Tensorflow Versions
+        versions = list(TENSORFLOW_REQUIREMENTS.values())[-1]
+        condaexe = ["conda", "search"]
+        pkgs = ["cudatoolkit", "cudnn"]
+        shell = self.env.os_version[0] == "Windows"
+        for pkg in pkgs:
+            chk = Popen(condaexe + [pkg], shell=shell, stdout=PIPE)
+            available = [line.split()
+                         for line in chk.communicate()[0].decode(self.env.encoding).splitlines()
+                         if line.startswith(pkg)]
+            compatible = [req for req in available
+                          if (pkg == "cudatoolkit" and req[1].startswith(versions[0]))
+                          or (pkg == "cudnn" and versions[0] in req[2]
+                              and req[1].startswith(versions[1]))]
+            candidate = "==".join(sorted(compatible, key=lambda x: x[1])[-1][:2])
+            self.conda_installer(candidate, verbose=True, conda_only=True)
 
 
 class Tips():
@@ -710,6 +907,7 @@ class Tips():
 if __name__ == "__main__":
     ENV = Environment()
     Checks(ENV)
+    ENV.set_config()
     if INSTALL_FAILED:
-        exit(1)
+        sys.exit(1)
     Install(ENV)
