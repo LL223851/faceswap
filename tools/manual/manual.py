@@ -18,9 +18,10 @@ from lib.multithreading import MultiThread
 from lib.utils import _video_extensions
 from plugins.extract.pipeline import Extractor, ExtractMedia
 
-from .detected_faces import DetectedFaces, ThumbsCreator
+from .detected_faces import DetectedFaces
 from .faceviewer.frame import FacesFrame
 from .frameviewer.frame import DisplayFrame
+from .thumbnails import ThumbsCreator
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
@@ -53,11 +54,18 @@ class Manual(tk.Tk):
                                              extractor)
 
         video_meta_data = self._detected_faces.video_meta_data
-        loader = FrameLoader(self._globals, arguments.frames, video_meta_data)
+        valid_meta = all(val is not None for val in video_meta_data.values())
 
-        self._detected_faces.load_faces()
+        loader = FrameLoader(self._globals, arguments.frames, video_meta_data)
+        if valid_meta:  # Load the faces whilst other threads complete if we have valid meta data
+            self._detected_faces.load_faces()
+
         self._containers = self._create_containers()
-        self._wait_for_threads(extractor, loader, video_meta_data)
+        self._wait_for_threads(extractor, loader, valid_meta)
+        if not valid_meta:
+            # Load the faces after other threads complete if meta data required updating
+            self._detected_faces.load_faces()
+
         self._generate_thumbs(arguments.frames, arguments.thumb_regen, arguments.single_process)
 
         self._display = DisplayFrame(self._containers["top"],
@@ -99,7 +107,7 @@ class Manual(tk.Tk):
             sys.exit(1)
         logger.debug("Test input file '%s' does not contain Faceswap header data", test_file)
 
-    def _wait_for_threads(self, extractor, loader, video_meta_data):
+    def _wait_for_threads(self, extractor, loader, valid_meta):
         """ The :class:`Aligner` and :class:`FramesLoader` are launched in background threads.
         Wait for them to be initialized prior to proceeding.
 
@@ -109,8 +117,9 @@ class Manual(tk.Tk):
             The extraction pipeline for the Manual Tool
         loader: :class:`FramesLoader`
             The frames loader for the Manual Tool
-        video_meta_data: dict
-            The video meta data that exists within the alignments file
+        valid_meta: bool
+            Whether the input video had valid meta-data on import, or if it had to be created.
+            ``True`` if valid meta data existed previously, ``False`` if it needed to be created
 
         Notes
         -----
@@ -129,7 +138,7 @@ class Manual(tk.Tk):
             sleep(1)
 
         extractor.link_faces(self._detected_faces)
-        if any(val is None for val in video_meta_data.values()):
+        if not valid_meta:
             logger.debug("Saving video meta data to alignments file")
             self._detected_faces.save_video_meta_data(**loader.video_meta_data)
 
@@ -307,7 +316,7 @@ class _Options(ttk.Frame):  # pylint:disable=too-many-ancestors
         self._initialize_face_options()
         frame = ttk.Frame(self)
         frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        panels = dict()
+        panels = {}
         for name, editor in self._display_frame.editors.items():
             logger.debug("Initializing control panel for '%s' editor", name)
             controls = editor.controls
@@ -317,7 +326,7 @@ class _Options(ttk.Frame):  # pylint:disable=too-many-ancestors
                                  max_columns=1,
                                  header_text=controls["header"],
                                  blank_nones=False,
-                                 label_width=18,
+                                 label_width=12,
                                  style="CPanel",
                                  scrollbar=False)
             panel.pack_forget()
@@ -413,10 +422,10 @@ class TkGlobals():
         dict
             The variable name as key, the variable as value
         """
-        retval = dict()
-        for name in ("frame_index", "transport_index", "face_index"):
+        retval = {}
+        for name in ("frame_index", "transport_index", "face_index", "filter_distance"):
             var = tk.IntVar()
-            var.set(0)
+            var.set(10 if name == "filter_distance" else 0)
             retval[name] = var
         for name in ("update", "update_active_viewport", "is_zoomed"):
             var = tk.BooleanVar()
@@ -494,6 +503,12 @@ class TkGlobals():
         """ :class:`tkinter.StringVar`: The variable holding the currently selected navigation
         filter mode. """
         return self._tk_vars["filter_mode"]
+
+    @property
+    def tk_filter_distance(self):
+        """ :class:`tkinter.DoubleVar`: The variable holding the currently selected threshold
+        distance for misaligned filter mode. """
+        return self._tk_vars["filter_distance"]
 
     @property
     def tk_faces_size(self):
@@ -673,7 +688,7 @@ class Aligner():
         logger.debug("Launching aligner initialization thread")
         thread = MultiThread(self._init_aligner,
                              thread_count=1,
-                             name="{}.init_aligner".format(self.__class__.__name__))
+                             name=f"{self.__class__.__name__}.init_aligner")
         thread.start()
         logger.debug("Launched aligner initialization thread")
         return thread
@@ -691,7 +706,8 @@ class Aligner():
                                 ["components", "extended"],
                                 exclude_gpus=exclude_gpus,
                                 multiprocess=True,
-                                normalize_method="hist")
+                                normalize_method="hist",
+                                disable_filter=True)
             if plugin:
                 aligner.set_batchsize("align", 1)  # Set the batchsize to 1
             aligner.launch()
@@ -786,7 +802,8 @@ class Aligner():
         for plugin, aligner in self._aligners.items():
             if plugin == "mask":
                 continue
-            aligner.set_aligner_normalization_method(method)
+            logger.debug("Setting to: '%s'", method)
+            aligner.aligner.set_normalize_method(method)
 
 
 class FrameLoader():
@@ -838,7 +855,7 @@ class FrameLoader():
                              frames_location,
                              video_meta_data,
                              thread_count=1,
-                             name="{}.init_frames".format(self.__class__.__name__))
+                             name=f"{self.__class__.__name__}.init_frames")
         thread.start()
         return thread
 

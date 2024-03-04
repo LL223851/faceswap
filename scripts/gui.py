@@ -29,7 +29,7 @@ class FaceswapGui(tk.Tk):
         self.objects = dict()
 
         get_images().delete_preview()
-        preview_trigger().clear()
+        preview_trigger().clear(trigger_type=None)
         self.protocol("WM_DELETE_WINDOW", self.close_app)
         self.build_gui()
         self._last_session = LastSession(self._config)
@@ -144,12 +144,12 @@ class FaceswapGui(tk.Tk):
         if not self._config.project.confirm_close():
             return
 
-        if self._config.tk_vars["runningtask"].get():
+        if self._config.tk_vars.running_task.get():
             self.wrapper.task.terminate()
 
         self._last_session.save()
         get_images().delete_preview()
-        preview_trigger().clear()
+        preview_trigger().clear(trigger_type=None)
         self.quit()
         logger.debug("Closed GUI")
         sys.exit(0)
@@ -161,16 +161,16 @@ class FaceswapGui(tk.Tk):
         -------
         bool: ``True`` if user confirms close, ``False`` if user cancels close
         """
-        if not self._config.tk_vars["runningtask"].get():
+        if not self._config.tk_vars.running_task.get():
             logger.debug("No tasks currently running")
             return True
 
         confirmtxt = "Processes are still running.\n\nAre you sure you want to exit?"
         if not messagebox.askokcancel("Close", confirmtxt, default="cancel", icon="warning"):
             logger.debug("Close Cancelled")
-            return True
+            return False
         logger.debug("Close confirmed")
-        return False
+        return True
 
 
 class Gui():  # pylint: disable=too-few-public-methods
